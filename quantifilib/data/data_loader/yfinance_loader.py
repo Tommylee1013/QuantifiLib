@@ -22,6 +22,8 @@ class YahooFinanceLoader(BaseDataLoader):
         :param kwargs:
         :return:
         """
+        if isinstance(symbols, str):
+            symbols = [symbols]
 
         data = yf.download(
             tickers = symbols,
@@ -30,17 +32,9 @@ class YahooFinanceLoader(BaseDataLoader):
             **kwargs
         )
 
-        # tidy multiindex format
-        if isinstance(data.columns, pd.MultiIndex):
-            stacked = []
-            for symbol in symbols:
-                if symbol in data.columns.levels[0]:
-                    sym_df = data[symbol].copy()
-                    sym_df['Symbol'] = symbol
-                    stacked.append(sym_df.reset_index())
-            result = pd.concat(stacked).set_index(['Symbol', 'Date']).sort_index()
-        else:
-            data['Symbol'] = symbols[0]
-            result = data.reset_index().set_index(['Symbol', 'Date'])
+        # # tidy multiindex format
+        # if not isinstance(data.columns, pd.MultiIndex):
+        #     symbol = symbols[0]
+        #     data.columns = pd.MultiIndex.from_product([[symbol], data.columns])
 
-        return result
+        return data

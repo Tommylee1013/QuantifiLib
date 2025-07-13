@@ -23,12 +23,16 @@ class NaverFinanceLoader(BaseDataLoader):
         :param kwargs:
         :return:
         """
-        frames = []
+        if isinstance(symbols, str):
+            symbols = [symbols]
+            single_symbol = True
+        else:
+            single_symbol = len(symbols) == 1
 
+        frames = []
         for symbol in symbols:
             try:
                 df = web.DataReader(symbol, data_source='naver', start=start, end=end, **kwargs)
-                df['Symbol'] = symbol
                 frames.append(df)
             except Exception as e:
                 print(f"[NaverFinanceLoader] Failed to load {symbol}: {e}")
@@ -36,6 +40,15 @@ class NaverFinanceLoader(BaseDataLoader):
         if not frames:
             return pd.DataFrame()
 
-        result = pd.concat(frames)
-        result = result.reset_index().set_index(['Symbol', 'Date']).sort_index()
-        return result
+        if single_symbol:
+            return frames[0]
+
+        # MultiIndex [(Symbol, Field)] → transpose → [(Field, Symbol)]
+        data = pd.concat(frames, axis=1, keys=symbols)
+        data.columns = data.columns.swaplevel(0, 1)  # (Symbol, Field) → (Field, Symbol)
+        data = data.sort_index(axis=1, level=0)
+        data = data.astype(float)
+        data.index = pd.to_datetime(data.index)
+        data['Volume'] = data['Volume'].astype(int)
+
+        return data
