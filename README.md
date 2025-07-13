@@ -10,7 +10,7 @@ Whether you're building event-driven strategies, training machine learning model
 ### 📁 Project Structure
 
 <pre lang="markdown">
-```text 
+
 quantifilib/
 └── data/
     ├── data_loader/
@@ -19,4 +19,4 @@ quantifilib/
     │   └── naver_loader.py
     └── stock_universe/
         └── wikipedia.py
-``` </pre>
+</pre>
