@@ -231,7 +231,7 @@ class TripleBarrierLabeling(BaseLabel) :
 
     def _add_vertical_barrier(self, t_events: pd.Index) -> Union[pd.Series, bool]:
         if all(v == 0 for v in self.vertical_barrier.values()):
-            return False
+            return pd.Series(pd.NaT, index=t_events)
         td = pd.Timedelta(
             f"{self.vertical_barrier.get('days',0)} days, "
             f"{self.vertical_barrier.get('hours',0)} hours, "
@@ -246,7 +246,7 @@ class TripleBarrierLabeling(BaseLabel) :
         target = self.target.loc[t_events]
         target = target[target > self.min_ret]
 
-        v_barriers = self._add_vertical_barrier(t_events) or pd.Series(pd.NaT, index=t_events)
+        v_barriers = self._add_vertical_barrier(t_events)
 
         if self.side_prediction is None:
             side_ = pd.Series(1.0, index=target.index)
@@ -286,9 +286,9 @@ class TripleBarrierLabeling(BaseLabel) :
         out_df['bin'] = label
         return out_df
 
-    def get_labels(self, drop_min_pct : float = None) -> pd.DataFrame:
+    def get_labels(self, ret_type:str='percentage', drop_min_pct : float = None) -> pd.DataFrame:
         events = self._get_events(
-            t_events = self.close.index[2:]
+            t_events = self.target.dropna().index
         )
 
         ev = events.dropna(subset=['t1'])
@@ -296,20 +296,29 @@ class TripleBarrierLabeling(BaseLabel) :
         prices = self.close.reindex(idx_union, method='bfill')
 
         out = pd.DataFrame(index=ev.index)
-        out['ret'] = np.log(prices.loc[ev['t1']].values / prices.loc[ev.index].values)
-        out['trgt'] = ev['trgt']
+
+        if ret_type == 'percentage':
+            out['ret'] = (prices.loc[ev['t1']].values / prices.loc[ev.index].values - 1)
+        elif ret_type == 'log' :
+            out['ret'] = np.log(prices.loc[ev['t1']].values / prices.loc[ev.index].values)
+        else : raise ValueError('ret_type must be either "percentage" or "log"')
+
+        out['trgt'] = ev['trgt'] # volatility target
+
         if 'side' in ev:
             out['ret'] *= ev['side']
 
         out = self._barrier_touched(out, events)
+
         if 'side' in ev:
             out.loc[out['ret'] <= 0, 'bin'] = 0
 
-        out['ret'] = np.exp(out['ret']) - 1
+        # out['ret'] = np.exp(out['ret']) - 1
+
         if 'side' in events:
             out['side'] = events['side']
 
-        if drop_labels is not None :
+        if drop_min_pct is not None :
             out = self._drop_labels(out, drop_min_pct)
 
         return out
