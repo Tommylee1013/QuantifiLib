@@ -20,7 +20,7 @@ class ARCHGenerator(BaseGenerator):
         Innovation distribution for z_t: 'normal' | 'student_t' | 'uniform'
     u_params : tuple
         Parameters for z_t.
-        - 'normal': (mu, sigma)  [default (0.0, 1.0); ARCH에서는 보통 (0,1) 권장]
+        - 'normal': (mu, sigma)  [default (0.0, 1.0)]
         - 'student_t': (df,)     [df>2; standardized to unit variance]
         - 'uniform': ()          [uses U(-sqrt(3), sqrt(3)) -> unit variance]
     Notes
