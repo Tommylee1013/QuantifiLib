@@ -1,11 +1,11 @@
 import numpy as np
 import pandas as pd
-from typing import List, Optional, Dict, Any, Union, Sequence
+from typing import List, Optional, Dict, Any, Union, Sequence, Mapping
 
 
 class HistoricalSimulation:
     """
-    Historical backtesting engine with rich market-microstructure features.
+    Historical backtesting engine
 
     Core capabilities
     -----------------
@@ -534,3 +534,612 @@ class HistoricalSimulation:
         if s.empty:
             return self.index_series * np.nan
         return self.index_series / float(s.iloc[0])
+
+class DollarCostAveragingSimulation:
+    """
+    Regular-investing (DCA) historical simulation engine.
+
+    Core ideas
+    ----------
+    - You provide valuation prices (for daily MTM) and execution prices (for trades).
+    - You provide an `initial_value` and a `contribution_series` that specifies the cash you add on each date.
+    - On each contribution date, the contributed cash is allocated across assets using either:
+        * equal weights across columns, or
+        * a user-supplied weight vector (Series) or a weight schedule (DataFrame) indexed by date.
+    - Can enforce integer (non-floating) share policy or allow fractional shares.
+    - Cash earns (or pays) daily accrual at deposit/borrow annual rates.
+    - Results stored on attributes and available via `get_results()`; NAV via `to_nav()`.
+    - Provides IRR (money-weighted), TWR (time-weighted), and simple PnL return.
+
+    Parameters
+    ----------
+    val_px : pd.DataFrame
+        Valuation price series for MTM. Index must be DatetimeIndex; columns are tickers.
+    exe_px : Optional[pd.DataFrame]
+        Execution price series for trading. Defaults to `val_px` if None.
+    initial_value : float
+        Initial cash at start (portfolio cash).
+    contribution_series : Union[pd.Series, float]
+        If Series: cash contributed on those dates (index must be subset of val_px.index).
+        If float: a constant contribution amount applied to every date in `rebalance_dates` (see below).
+    weights : Optional[Union[pd.Series, pd.DataFrame, Mapping[str, float], str]]
+        - None or "equal": equal-weight allocation (for multi-asset).
+        - pd.Series / Mapping[str, float]: static weights across columns (will be normalized to sum to 1).
+        - pd.DataFrame: date-indexed row weights aligned to `rebalance_dates` (will be normalized row-wise).
+        - For single-asset, this is ignored.
+    allow_partial_shares : bool
+        If False, shares are rounded down to integer lots (`min_lot`).
+    min_lot : int
+        Minimum lot size per trade if `allow_partial_shares=False`. Default=1 (integer shares).
+    use_next_open : bool
+        If True, trades execute at the next available timestamp in `exe_px` strictly after the contribution date.
+        If False, trades execute at the same date's execution price (close-at-close style).
+    deposit_rate_annual : float
+        Annualized deposit rate for positive cash (e.g., 0.03 = 3%).
+    borrow_rate_annual : float
+        Annualized borrow rate for negative cash.
+    commission : Optional[Dict[str, float]]
+        Commission spec:
+            - "variable_bps": float (basis points on notional)
+            - "fixed": float (fixed fee per trade)
+            - "min_per_trade": float (minimum fee per trade)
+        Defaults to none.
+    cap_trade_pct : float
+        Optional cap on absolute per-ticker notional as a fraction of current portfolio value at the contribution date.
+        Use 1.0 to disable (default).
+    tick_size : Optional[Union[float, Mapping[str, float]]]
+        Optional price tick size to slighty worsen effective price (half-tick). If None, no adjustment.
+
+    Notes
+    -----
+    - `rebalance_dates` are set internally to the union of:
+        * all dates where `contribution_series` (if Series) is non-zero, and
+        * the first index date when `initial_value > 0`.
+      If `contribution_series` is a scalar, then every `val_px.index` date is a contribution date with that amount.
+    - Cash flows ledger:
+        * External flows are contributions (negative from the investor perspective; added to portfolio cash here).
+        * For IRR, we treat contributions as negative flows at their dates and the terminal liquidation as a positive flow.
+    """
+
+    # ----------------------------
+    # Construction & configuration
+    # ----------------------------
+    def __init__(
+        self,
+        val_px: pd.DataFrame,
+        exe_px: Optional[pd.DataFrame] = None,
+        *,
+        initial_value: float = 0.0,
+        contribution_series: Union[pd.Series, float] = 0.0,
+        weights: Optional[Union[pd.Series, pd.DataFrame, Mapping[str, float], str]] = None,
+        allow_partial_shares: bool = True,
+        min_lot: int = 1,
+        use_next_open: bool = False,
+        deposit_rate_annual: float = 0.0,
+        borrow_rate_annual: float = 0.0,
+        commission: Optional[Dict[str, float]] = None,
+        cap_trade_pct: float = 1.0,
+        tick_size: Optional[Union[float, Mapping[str, float]]] = None,
+    ):
+        self.val_px = self._coerce_df(val_px, name="val_px")
+        self.exe_px = self._coerce_df(exe_px if exe_px is not None else val_px, name="exe_px")
+        self.initial_value = float(initial_value)
+        self.contribution_series = contribution_series
+        self.weights_raw = weights
+        self.allow_partial_shares = bool(allow_partial_shares)
+        self.min_lot = int(min_lot)
+        self.use_next_open = bool(use_next_open)
+        self.deposit_rate_annual = float(deposit_rate_annual)
+        self.borrow_rate_annual = float(borrow_rate_annual)
+        self.commission = commission or {}
+        self.cap_trade_pct = float(cap_trade_pct)
+        self.tick_size = tick_size
+
+        # Outputs
+        self.index_series: Optional[pd.Series] = None
+        self.cash_series: Optional[pd.Series] = None
+        self.shares_record: Optional[pd.DataFrame] = None
+        self.trade_ledger: Optional[pd.DataFrame] = None
+        self.shares_ledger: Optional[pd.DataFrame] = None
+        self.logs: List[str] = []
+
+        # Derived
+        self.rebalance_dates: Optional[pd.DatetimeIndex] = None
+        self.weights_df: Optional[pd.DataFrame] = None
+
+    # -------------
+    # Public API
+    # -------------
+    def run(self) -> "DollarCostAveragingSimulation":
+        """
+        Execute the simulation. Results are stored on the instance attributes.
+        """
+        self._validate_inputs()
+
+        idx = self.val_px.index
+        cols = self.val_px.columns
+
+        index_series = pd.Series(index=idx, dtype=float)
+        cash_series = pd.Series(0.0, index=idx, dtype=float)
+        shares_record = pd.DataFrame(0.0, index=[], columns=cols)
+
+        trade_rows: List[Dict[str, Any]] = []
+        hold_rows: List[Dict[str, Any]] = []
+
+        # state
+        prev_shares = pd.Series(0.0, index=cols)
+        cash = float(self.initial_value)
+
+        # daily accrual factors
+        dep_d = self._daily_rate(self.deposit_rate_annual)
+        bor_d = self._daily_rate(self.borrow_rate_annual)
+
+        # pre-build rebalance dates & weights frame
+        self._build_rebalance_and_weights()
+
+        # helper: MTM & cash accrual over date slice with a fixed share vector
+        def apply_mtm_and_accrual(dates: pd.DatetimeIndex, shares_vec: pd.Series, cash_balance: float):
+            nonlocal index_series, cash_series
+            if len(dates) == 0:
+                return cash_balance
+            for d in dates:
+                port_val_ex_cash = float((self.val_px.loc[d] * shares_vec).sum())
+                # daily cash accrual
+                if cash_balance >= 0:
+                    cash_balance *= (1.0 + dep_d)
+                else:
+                    cash_balance *= (1.0 + bor_d)
+                # write end-of-day values
+                index_series.loc[d] = port_val_ex_cash + cash_balance
+                cash_series.loc[d] = cash_balance
+            return cash_balance
+
+        # main loop over contribution/rebalance dates
+        last_written_date = None
+        for i, dt in enumerate(self.rebalance_dates):
+            # accrual & MTM between last written day and day before trade execution
+            exec_dt = self._exec_date(dt)
+            left = self.val_px.loc[(last_written_date or idx[0]):exec_dt].index
+            if last_written_date is None:
+                # from series start up to exec_dt-1 (no previous writes yet)
+                if len(left) > 1:
+                    cash = apply_mtm_and_accrual(left[:-1], prev_shares, cash)
+            else:
+                # we already wrote last_written_date; continue after it
+                if len(left) > 1:
+                    cash = apply_mtm_and_accrual(left[1:-1], prev_shares, cash)
+
+            # 1) bring in external contribution (if any) at dt
+            contrib_amt = self._contribution_at(dt)
+            if abs(contrib_amt) > 0:
+                cash += float(contrib_amt)
+                self._log(f"[FLOW] {dt.date()} external contribution +{contrib_amt:,.2f}")
+
+            # 2) compute target buy notional by current weights * contribution_at_dt (only fresh cash)
+            #    If negative cash (unlikely for pure DCA), we still respect cap/rounding logic.
+            px_exec_row = self.exe_px.loc[exec_dt]
+            w_row = self._normalize_row(self.weights_df.loc[dt]) if len(cols) > 1 else pd.Series({cols[0]: 1.0})
+            buy_notional_target = max(0.0, float(contrib_amt))  # we only invest positive contributions
+            target_notionals = w_row * buy_notional_target
+
+            # cap per-ticker notional relative to portfolio value, if requested
+            if self.cap_trade_pct < 1.0 - 1e-12:
+                pv_before = float((self.val_px.loc[dt] * prev_shares).sum() + cash)
+                cap_abs = max(0.0, self.cap_trade_pct * pv_before)
+                if cap_abs > 0:
+                    target_notionals = target_notionals.clip(upper=cap_abs)
+
+            # translate notionals to raw share deltas
+            with np.errstate(divide="ignore", invalid="ignore"):
+                raw_delta = (target_notionals / px_exec_row.replace(0.0, np.nan)).fillna(0.0)
+
+            # rounding policy
+            delta = raw_delta.copy()
+            if not self.allow_partial_shares:
+                for tic in cols:
+                    q = float(delta[tic])
+                    delta[tic] = self._lot_round(q, self.min_lot)
+
+            # compute effective prices and commissions; ensure cash sufficiency (scale down if needed)
+            variable_bps = self.commission.get("variable_bps", 0.0) / 1e4
+            fixed_fee = self.commission.get("fixed", 0.0)
+            min_fee = self.commission.get("min_per_trade", 0.0)
+
+            eff_px_map: Dict[str, float] = {}
+            buy_notional = 0.0
+            trade_cost_total = 0.0
+            for tic in cols:
+                q = float(delta[tic])
+                if q <= 1e-12:
+                    eff = float(px_exec_row[tic])
+                else:
+                    eff = self._eff_price(float(px_exec_row[tic]), "buy", self._get_tick(tic))
+                eff_px_map[tic] = eff
+                notional = max(0.0, q) * eff
+                fee = 0.0 if q <= 1e-12 else max(notional * variable_bps + fixed_fee, min_fee)
+                buy_notional += notional
+                trade_cost_total += fee
+
+            tentative_cash = cash - buy_notional - trade_cost_total
+
+            # scale down if cash deficit
+            if tentative_cash < -1e-8 and buy_notional > 0:
+                scale = max(0.0, (cash - trade_cost_total) / buy_notional)
+                self._log(f"[INFO] {dt.date()} scaled buys by {scale:.4f} (cash constraint).")
+                for tic in cols:
+                    if delta[tic] > 0:
+                        delta[tic] *= scale
+                        if not self.allow_partial_shares:
+                            delta[tic] = self._lot_round(delta[tic], self.min_lot)
+
+                # recompute totals after scaling
+                buy_notional = 0.0
+                trade_cost_total = 0.0
+                for tic in cols:
+                    q = float(delta[tic])
+                    if q <= 1e-12:
+                        continue
+                    eff = eff_px_map[tic]
+                    notional = q * eff
+                    fee = max(notional * variable_bps + fixed_fee, min_fee)
+                    buy_notional += notional
+                    trade_cost_total += fee
+                tentative_cash = cash - buy_notional - trade_cost_total
+
+            # apply execution at exec_dt
+            cash = tentative_cash
+            new_shares = prev_shares + delta
+
+            # ledgers
+            for tic in cols:
+                q = float(delta[tic])
+                if q > 1e-12:
+                    notional = q * eff_px_map[tic]
+                    fee = max(notional * variable_bps + fixed_fee, min_fee)
+                    trade_rows.append({
+                        "date": exec_dt,
+                        "ticker": tic,
+                        "side": "buy",
+                        "shares_delta": q,
+                        "exec_price_eff": eff_px_map[tic],
+                        "notional": notional,
+                        "commission": fee,
+                    })
+                # snapshot
+                hold_rows.append({
+                    "date": exec_dt,
+                    "ticker": tic,
+                    "price_ref": float(px_exec_row[tic]),
+                    "shares": float(new_shares[tic]),
+                    "amount": float(new_shares[tic] * float(px_exec_row[tic])),
+                })
+
+            # append holdings row
+            shares_record.loc[exec_dt, cols] = new_shares.values
+
+            # MTM from exec_dt through the next key date (or end)
+            next_dt = (self.rebalance_dates[i + 1] if i < len(self.rebalance_dates) - 1 else idx[-1])
+            right = self.val_px.loc[exec_dt:next_dt].index
+            cash = apply_mtm_and_accrual(right, new_shares, cash)
+
+            prev_shares = new_shares.copy()
+            last_written_date = right[-1] if len(right) else exec_dt
+
+        # finalize
+        self.index_series = index_series.astype(float)
+        self.cash_series = cash_series.astype(float)
+        self.shares_record = shares_record.sort_index().astype(float)
+        self.trade_ledger = pd.DataFrame(trade_rows).sort_values("date").reset_index(drop=True)
+        self.shares_ledger = pd.DataFrame(hold_rows).sort_values("date").reset_index(drop=True)
+
+        return self
+
+    def get_results(self) -> Dict[str, Any]:
+        """Return all result objects."""
+        if any(obj is None for obj in [self.index_series, self.cash_series, self.shares_record]):
+            raise RuntimeError("Run the simulation first with `.run()`.")
+        return {
+            "index_series": self.index_series,
+            "cash_series": self.cash_series,
+            "shares_record": self.shares_record,
+            "trade_ledger": self.trade_ledger,
+            "shares_ledger": self.shares_ledger,
+            "logs": self.logs,
+        }
+
+    def to_nav(self) -> pd.Series:
+        """Return NAV series normalized to 1.0 at the first non-NaN value."""
+        s = self.index_series.dropna()
+        if s.empty:
+            return self.index_series * np.nan
+        return self.index_series / float(s.iloc[0])
+
+    # -----------------------
+    # Performance statistics
+    # -----------------------
+    def money_weighted_irr(self) -> float:
+        """
+        Money-weighted return (IRR) using irregular cash flows (XIRR).
+        Contributions are negative flows (investor outflow), terminal value is a positive flow.
+        """
+        if self.index_series is None:
+            raise RuntimeError("Run the simulation first.")
+        flows = []
+        dates = []
+
+        # initial value as negative flow at the first available date (if provided)
+        first_date = self.index_series.first_valid_index()
+        if first_date is None:
+            return np.nan
+        if self.initial_value != 0:
+            flows.append(-float(self.initial_value))
+            dates.append(pd.Timestamp(first_date))
+
+        # contribution flows
+        if isinstance(self.contribution_series, pd.Series):
+            cs = self.contribution_series[self.contribution_series != 0]
+            for d, v in cs.items():
+                flows.append(-float(v))
+                dates.append(pd.Timestamp(d))
+        elif isinstance(self.contribution_series, (int, float)) and abs(self.contribution_series) > 0:
+            for d in self.rebalance_dates:
+                flows.append(-float(self.contribution_series))
+                dates.append(pd.Timestamp(d))
+
+        # terminal liquidation at the last index date
+        last_date = self.index_series.last_valid_index()
+        terminal_value = float(self.index_series.loc[last_date])
+        flows.append(terminal_value)
+        dates.append(pd.Timestamp(last_date))
+
+        return self._xirr(np.array(flows, dtype=float), pd.to_datetime(dates))
+
+    def time_weighted_return(self) -> float:
+        """
+        Time-weighted return (TWR), chain-linking subperiod returns between external flows.
+        """
+        if self.index_series is None:
+            raise RuntimeError("Run the simulation first.")
+        nav = self.index_series.astype(float)
+
+        # define flow dates
+        flow_dates = []
+        if self.initial_value != 0:
+            flow_dates.append(nav.first_valid_index())
+        if isinstance(self.contribution_series, pd.Series):
+            flow_dates.extend(list(self.contribution_series[self.contribution_series != 0].index))
+        elif isinstance(self.contribution_series, (int, float)) and abs(self.contribution_series) > 0:
+            flow_dates.extend(list(self.rebalance_dates))
+
+        flow_dates = sorted(set(pd.to_datetime(flow_dates)))  # unique
+
+        # build subperiods as (start_exclusive, end_inclusive)
+        dates = nav.dropna().index
+        if len(dates) == 0:
+            return np.nan
+        ends = list(sorted(set(flow_dates + [dates[-1]])))
+        starts = [dates[0]] + ends[:-1]
+
+        rets = []
+        for s, e in zip(starts, ends):
+            if s == e:
+                continue
+            # subperiod return: (V_e - sum(flows in (s, e]) - V_s) / V_s
+            V_s = float(nav.loc[s])
+            V_e = float(nav.loc[e])
+            cf = 0.0
+            for d in flow_dates:
+                if (d > s) and (d <= e):
+                    if d == dates[0] and self.initial_value != 0:
+                        cf += float(self.initial_value)
+                    else:
+                        if isinstance(self.contribution_series, pd.Series):
+                            if d in self.contribution_series.index:
+                                cf += float(self.contribution_series.loc[d])
+                        else:
+                            # scalar contribution
+                            if abs(self.contribution_series) > 0 and d in self.rebalance_dates:
+                                cf += float(self.contribution_series)
+            # From the portfolio's perspective, contributions increase V_e by cf;
+            # to get the pure return, remove cf from V_e.
+            R = (V_e - cf - V_s) / max(1e-12, V_s)
+            rets.append(1.0 + R)
+
+        if len(rets) == 0:
+            return 0.0
+        return float(np.prod(rets) - 1.0)
+
+    def simple_return_on_invested(self) -> float:
+        """
+        Simple return on invested capital: (FinalValue - NetInvested) / NetInvested,
+        where NetInvested = initial_value + sum(contributions).
+        """
+        if self.index_series is None:
+            raise RuntimeError("Run the simulation first.")
+        V_T = float(self.index_series.dropna().iloc[-1])
+        net_invested = float(self.initial_value)
+        if isinstance(self.contribution_series, pd.Series):
+            net_invested += float(self.contribution_series.sum())
+        else:
+            if abs(self.contribution_series) > 0:
+                net_invested += float(self.contribution_series) * int(len(self.rebalance_dates))
+        if net_invested == 0:
+            return np.nan
+        return (V_T - net_invested) / net_invested
+
+    # -----------------------------
+    # Internal helpers / utilities
+    # -----------------------------
+    @staticmethod
+    def _coerce_df(df: pd.DataFrame, name: str) -> pd.DataFrame:
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError(f"{name} must be a DataFrame.")
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise TypeError(f"{name}.index must be a DatetimeIndex.")
+        if df.isnull().all().all():
+            raise ValueError(f"{name} has all-NaN values.")
+        return df.sort_index()
+
+    def _validate_inputs(self):
+        if not self.val_px.index.equals(self.val_px.index.unique()):
+            raise ValueError("val_px index contains duplicates.")
+        if not self.exe_px.index.equals(self.exe_px.index.unique()):
+            raise ValueError("exe_px index contains duplicates.")
+        if not self.val_px.index.is_monotonic_increasing:
+            raise ValueError("val_px index must be increasing.")
+        if not self.exe_px.index.is_monotonic_increasing:
+            raise ValueError("exe_px index must be increasing.")
+        if not set(self.val_px.columns) <= set(self.exe_px.columns):
+            missing = set(self.val_px.columns) - set(self.exe_px.columns)
+            raise ValueError(f"exe_px missing columns: {missing}")
+        if not (self.min_lot >= 1):
+            raise ValueError("min_lot must be >= 1")
+
+    def _build_rebalance_and_weights(self):
+        idx = self.val_px.index
+        cols = self.val_px.columns
+
+        # contribution dates
+        if isinstance(self.contribution_series, pd.Series):
+            cs = self.contribution_series.copy()
+            if not isinstance(cs.index, pd.DatetimeIndex):
+                raise TypeError("contribution_series index must be DatetimeIndex.")
+            cs = cs.reindex(idx).fillna(0.0)
+            dates = list(cs.index[cs != 0.0])
+        else:
+            # scalar: contribute every day
+            if abs(self.contribution_series) > 0:
+                dates = list(idx)
+            else:
+                dates = []
+
+        # ensure we include start if initial_value > 0
+        if self.initial_value != 0 and len(idx) > 0:
+            if len(dates) == 0 or idx[0] < pd.to_datetime(dates[0]):
+                dates = sorted(set([idx[0]] + dates))
+
+        self.rebalance_dates = pd.DatetimeIndex(sorted(set(dates)))
+
+        # weights frame
+        if len(cols) == 1:
+            self.weights_df = pd.DataFrame({cols[0]: 1.0}, index=self.rebalance_dates)
+            return
+
+        if self.weights_raw is None or (isinstance(self.weights_raw, str) and self.weights_raw.lower() == "equal"):
+            w = pd.Series(1.0 / len(cols), index=cols)
+            self.weights_df = pd.DataFrame([w.values] * len(self.rebalance_dates), index=self.rebalance_dates, columns=cols)
+        elif isinstance(self.weights_raw, (pd.Series, dict, Mapping)):
+            w = pd.Series(self.weights_raw, index=cols).fillna(0.0)
+            self.weights_df = pd.DataFrame([w.values] * len(self.rebalance_dates), index=self.rebalance_dates, columns=cols)
+        elif isinstance(self.weights_raw, pd.DataFrame):
+            dfw = self.weights_raw.reindex(self.rebalance_dates).reindex(columns=cols).fillna(0.0)
+            self.weights_df = dfw
+        else:
+            raise TypeError("Invalid `weights` type. Use None/'equal', Series/Mapping, or DataFrame.")
+
+        # normalize rows (avoid all-zero)
+        self.weights_df = self.weights_df.apply(self._normalize_row, axis=1)
+
+    def _normalize_row(self, row: Union[pd.Series, pd.DataFrame]) -> pd.Series:
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        s = pd.Series(row).fillna(0.0)
+        tot = float(s.sum())
+        if tot <= 0:
+            # default to equal if user gave all zeros
+            return pd.Series(1.0 / len(s), index=s.index)
+        return s / tot
+
+    def _exec_date(self, dt: pd.Timestamp) -> pd.Timestamp:
+        if not self.use_next_open:
+            return dt
+        pos = self.exe_px.index.searchsorted(dt, side="right")
+        if pos >= len(self.exe_px.index):
+            return self.exe_px.index[-1]
+        return self.exe_px.index[pos]
+
+    @staticmethod
+    def _daily_rate(annual_rate: float) -> float:
+        if annual_rate == 0:
+            return 0.0
+        return (1.0 + annual_rate) ** (1.0 / 252.0) - 1.0
+
+    @staticmethod
+    def _lot_round(q: float, lot: int) -> float:
+        """Round down to nearest multiple of lot (buys only in this engine)."""
+        if q <= 0:
+            return 0.0
+        return float((int(q) // lot) * lot)
+
+    def _log(self, msg: str):
+        self.logs.append(msg)
+
+    def _get_tick(self, ticker: str) -> Optional[float]:
+        if self.tick_size is None:
+            return None
+        if isinstance(self.tick_size, Mapping):
+            return float(self.tick_size.get(ticker, 0.0))
+        return float(self.tick_size)
+
+    @staticmethod
+    def _eff_price(px: float, side: str, tick: Optional[float]) -> float:
+        """
+        Apply a half-tick adverse selection to execution price (optional).
+        """
+        if (tick is None) or (tick <= 0):
+            return float(px)
+        half = 0.5 * float(tick)
+        if side == "buy":
+            return float(px) + half
+        else:
+            return float(px) - half
+
+    def _contribution_at(self, dt: pd.Timestamp) -> float:
+        if isinstance(self.contribution_series, pd.Series):
+            v = float(self.contribution_series.reindex([dt]).fillna(0.0).iloc[0])
+            return v
+        else:
+            return float(self.contribution_series) if abs(self.contribution_series) > 0 else 0.0
+
+    # -------------------
+    # IRR (XIRR) utility
+    # -------------------
+    @staticmethod
+    def _xnpv(rate: float, cashflows: np.ndarray, dates: pd.DatetimeIndex) -> float:
+        """Present value at `rate` for irregular dated cashflows."""
+        if rate <= -1.0:
+            return np.inf
+        t0 = dates[0]
+        years = np.array([(d - t0).days / 365.2425 for d in dates], dtype=float)
+        disc = (1.0 + rate) ** years
+        return float(np.sum(cashflows / disc))
+
+    def _xirr(self, cashflows: np.ndarray, dates: pd.DatetimeIndex) -> float:
+        """Solve for r such that XNPV(r)=0 via bracketed Newton/Bisect hybrid."""
+        # quick exit
+        if len(cashflows) < 2:
+            return np.nan
+        # bracket search
+        low, high = -0.9999, 10.0
+        f_low = self._xnpv(low, cashflows, dates)
+        f_high = self._xnpv(high, cashflows, dates)
+        # expand high if same sign
+        tries = 0
+        while np.sign(f_low) == np.sign(f_high) and tries < 20:
+            high *= 2.0
+            f_high = self._xnpv(high, cashflows, dates)
+            tries += 1
+        if np.sign(f_low) == np.sign(f_high):
+            return np.nan  # cannot bracket
+
+        # bisection
+        for _ in range(100):
+            mid = 0.5 * (low + high)
+            f_mid = self._xnpv(mid, cashflows, dates)
+            if abs(f_mid) < 1e-10:
+                return float(mid)
+            if np.sign(f_mid) == np.sign(f_low):
+                low, f_low = mid, f_mid
+            else:
+                high, f_high = mid, f_mid
+        return float(0.5 * (low + high))
