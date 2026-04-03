@@ -7,7 +7,8 @@ setup(
     description="A modular quantitative finance research library",
     packages=find_packages(),
     install_requires=[
-        "pandas", "numpy", "yfinance", "pandas-datareader", "matplotlib"
+        "pandas", "numpy", "yfinance", "pandas-datareader", "matplotlib",
+        "seaborn", "scikit-learn", "statsmodels",
     ],
     python_requires=">=3.8",
 )

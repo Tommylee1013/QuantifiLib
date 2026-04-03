@@ -7,36 +7,37 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
+from src.monte_carlo import BaseMonteCarlo, GaussianMonteCarlo
 from src.risk.results.var_results import VaRResult
 from src.common.decorators import validate_common_var_inputs
 from src.risk.utils.metrics import VaRMetricsHelper
 from src.common.transformers import InputTransformer
 from src.common.validators import VaRValidator
 
-class BaseVaR(ABC) :
+
+class BaseVaR(ABC):
     """
-    Base class for Value-at-Risk style risk engines
+    Base class for Value-at-Risk style risk engines.
 
     This class provides:
     - common validation flow
     - input standardization
-    - historical / parametric / stressed VaR
+    - historical / parametric / stressed / monte carlo VaR
     - generic stress test
     - expected shortfall
     - shared utility methods
 
     Child classes should implement domain-specific return/PnL preparation logic.
     """
+
     def __init__(
-            self, position_value : float,
-            returns : pd.Series | None = None,
-            prices : pd.Series | None = None,
-            return_method : str = 'simple',
-            name : str | None = None,
-        ) -> None:
-        """
-        Initializer for BaseVaR
-        """
+        self,
+        position_value: float,
+        returns: pd.Series | None = None,
+        prices: pd.Series | None = None,
+        return_method: str = "simple",
+        name: str | None = None,
+    ) -> None:
         self.validator = VaRValidator()
         self.transformer = InputTransformer()
         self.metrics = VaRMetricsHelper()
@@ -45,8 +46,8 @@ class BaseVaR(ABC) :
         self.position_value = float(position_value)
         self.name = name or self.__class__.__name__
 
-        self.prices : pd.Series | None = None
-        self.returns : pd.Series | None = None
+        self.prices: pd.Series | None = None
+        self.returns: pd.Series | None = None
         self.return_method = return_method
 
         if prices is not None:
@@ -70,42 +71,60 @@ class BaseVaR(ABC) :
             self.validator.validate_returns(self.returns, name="returns")
 
     @abstractmethod
-    def _prepare_returns(self) -> pd.Series :
+    def _prepare_returns(self) -> pd.Series:
         """
-        Return a clean return series used for VaR or ES calculations
+        Return a clean return series used for VaR / ES calculations.
         Child classes may override this when raw returns need custom construction.
-        :return:
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
-    def _get_returns(self) -> pd.Series :
+    def _get_returns(self) -> pd.Series:
         returns = self._prepare_returns()
-        self.validator.validate_returns(returns, name = 'prepared_returns')
+        self.validator.validate_returns(returns, name="prepared_returns")
         return returns
 
     def _build_result(
-            self, metric_name : str,
-            method : str,
-            value : float,
-            confidence_level : float | None = None,
-            holding_period : int | None = None,
-            **metadata : Any,
-        ) -> VaRResult :
+        self,
+        metric_name: str,
+        method: str,
+        value: float,
+        confidence_level: float | None = None,
+        holding_period: int | None = None,
+        **metadata: Any,
+    ) -> VaRResult:
         return VaRResult(
-            metric_name = metric_name,
-            method = method,
-            value = float(value),
-            confidence_level = confidence_level,
-            holding_period = holding_period,
-            position_value = self.position_value,
-            metadata = metadata
+            metric_name=metric_name,
+            method=method,
+            value=float(value),
+            confidence_level=confidence_level,
+            holding_period=holding_period,
+            position_value=self.position_value,
+            metadata=metadata,
         )
 
+    def _resolve_mc_engine(
+        self,
+        mc_engine: BaseMonteCarlo | None = None,
+    ) -> BaseMonteCarlo:
+        """
+        Resolve Monte Carlo engine.
+        If no engine is provided, use GaussianMonteCarlo as the default.
+        """
+        if mc_engine is None:
+            return GaussianMonteCarlo()
+
+        if not isinstance(mc_engine, BaseMonteCarlo):
+            raise TypeError("mc_engine must be an instance of BaseMonteCarlo.")
+
+        return mc_engine
+
+    @validate_common_var_inputs
     def historical_var(
-            self, confidence_level : float = 0.95,
-            holding_period : int = 1,
-            as_result : bool = False
-        ) -> float | VaRResult :
+        self,
+        confidence_level: float = 0.95,
+        holding_period: int = 1,
+        as_result: bool = False,
+    ) -> float | VaRResult:
         returns = self._get_returns()
         scaled_returns = self.metrics.sqrt_time_scale_returns(returns, holding_period)
         var_return = self.metrics.quantile_return(scaled_returns, confidence_level)
@@ -113,21 +132,21 @@ class BaseVaR(ABC) :
 
         if as_result:
             return self._build_result(
-                metric_name = "VaR",
-                method = "historical",
-                value = var_amount,
-                confidence_level = confidence_level,
-                holding_period = holding_period,
+                metric_name="VaR",
+                method="historical",
+                value=var_amount,
+                confidence_level=confidence_level,
+                holding_period=holding_period,
             )
         return var_amount
 
     @validate_common_var_inputs
     def parametric_var(
-            self,
-            confidence_level: float = 0.95,
-            holding_period: int = 1,
-            use_mean: bool = True,
-            as_result: bool = False,
+        self,
+        confidence_level: float = 0.95,
+        holding_period: int = 1,
+        use_mean: bool = True,
+        as_result: bool = False,
     ) -> float | VaRResult:
         returns = self._get_returns()
         mu = float(returns.mean()) if use_mean else 0.0
@@ -149,12 +168,69 @@ class BaseVaR(ABC) :
         return var_amount
 
     @validate_common_var_inputs
+    def monte_carlo_var(
+        self,
+        confidence_level: float = 0.95,
+        holding_period: int = 1,
+        mc_engine: BaseMonteCarlo | None = None,
+        as_result: bool = False,
+        **engine_kwargs: Any,
+    ) -> float | VaRResult:
+        """
+        Monte Carlo VaR using an external simulation engine.
+
+        Parameters
+        ----------
+        confidence_level : float, default 0.95
+            Confidence level for VaR calculation.
+        holding_period : int, default 1
+            Risk horizon.
+        mc_engine : BaseMonteCarlo | None, default None
+            Monte Carlo engine instance. If None, GaussianMonteCarlo is used.
+        as_result : bool, default False
+            If True, return VaRResult.
+        **engine_kwargs : Any
+            Additional engine-specific keyword arguments passed to simulate_returns().
+        """
+        returns = self._get_returns()
+        engine = self._resolve_mc_engine(mc_engine)
+
+        simulated_returns = engine.simulate_returns(
+            returns=returns,
+            holding_period=holding_period,
+            **engine_kwargs,
+        )
+
+        simulated_returns = self.transformer.to_series(
+            simulated_returns,
+            name="simulated_returns",
+            dtype=float,
+        )
+        self.validator.validate_returns(simulated_returns, name="simulated_returns")
+
+        var_return = self.metrics.quantile_return(simulated_returns, confidence_level)
+        var_amount = self.metrics.return_to_loss_amount(var_return, self.position_value)
+
+        if as_result:
+            return self._build_result(
+                metric_name="VaR",
+                method="monte_carlo",
+                value=var_amount,
+                confidence_level=confidence_level,
+                holding_period=holding_period,
+                mc_engine=engine.__class__.__name__,
+                engine_params=engine.get_params(),
+                engine_kwargs=engine_kwargs,
+            )
+        return var_amount
+
+    @validate_common_var_inputs
     def stressed_var(
-            self,
-            stress_returns: pd.Series,
-            confidence_level: float = 0.95,
-            holding_period: int = 1,
-            as_result: bool = False,
+        self,
+        stress_returns: pd.Series,
+        confidence_level: float = 0.95,
+        holding_period: int = 1,
+        as_result: bool = False,
     ) -> float | VaRResult:
         stress_returns = self.transformer.to_series(
             stress_returns,
@@ -178,9 +254,9 @@ class BaseVaR(ABC) :
         return var_amount
 
     def stress_test(
-            self,
-            shocks: float | list[float] | np.ndarray | pd.Series,
-            as_result: bool = False,
+        self,
+        shocks: float | list[float] | np.ndarray | pd.Series,
+        as_result: bool = False,
     ) -> pd.DataFrame | list[VaRResult]:
         shock_list = self.transformer.scalar_to_list(shocks)
         self.validator.validate_shock_values(shock_list)
@@ -218,13 +294,15 @@ class BaseVaR(ABC) :
 
     @validate_common_var_inputs
     def expected_shortfall(
-            self,
-            confidence_level: float = 0.95,
-            holding_period: int = 1,
-            method: str = "historical",
-            use_mean: bool = True,
-            stress_returns: pd.Series | None = None,
-            as_result: bool = False,
+        self,
+        confidence_level: float = 0.95,
+        holding_period: int = 1,
+        method: str = "historical",
+        use_mean: bool = True,
+        stress_returns: pd.Series | None = None,
+        mc_engine: BaseMonteCarlo | None = None,
+        as_result: bool = False,
+        **engine_kwargs: Any,
     ) -> float | VaRResult:
         method = method.lower()
 
@@ -241,16 +319,35 @@ class BaseVaR(ABC) :
             alpha = 1.0 - confidence_level
             z_alpha = norm.ppf(alpha)
             es_return = (
-                    mu * holding_period
-                    - sigma * np.sqrt(holding_period) * norm.pdf(z_alpha) / alpha
+                mu * holding_period
+                - sigma * np.sqrt(holding_period) * norm.pdf(z_alpha) / alpha
             )
+
+        elif method == "monte_carlo":
+            returns = self._get_returns()
+            engine = self._resolve_mc_engine(mc_engine)
+
+            simulated_returns = engine.simulate_returns(
+                returns=returns,
+                holding_period=holding_period,
+                **engine_kwargs,
+            )
+
+            simulated_returns = self.transformer.to_series(
+                simulated_returns,
+                name="simulated_returns",
+                dtype=float,
+            )
+            self.validator.validate_returns(simulated_returns, name="simulated_returns")
+
+            es_return = self.metrics.tail_mean_return(simulated_returns, confidence_level)
 
         elif method == "stressed":
             self.validator.validate_required(stress_returns, "stress_returns")
             stress_returns = self.transformer.to_series(
                 stress_returns,
-                name = "stress_returns",
-                dtype = float,
+                name="stress_returns",
+                dtype=float,
             )
             self.validator.validate_returns(stress_returns, name="stress_returns")
             scaled_returns = self.metrics.sqrt_time_scale_returns(stress_returns, holding_period)
@@ -258,19 +355,31 @@ class BaseVaR(ABC) :
 
         else:
             raise ValueError(
-                "method must be one of: 'historical', 'parametric', 'stressed'."
+                "method must be one of: 'historical', 'parametric', 'monte_carlo', 'stressed'."
             )
 
         es_amount = self.metrics.return_to_loss_amount(es_return, self.position_value)
 
         if as_result:
+            metadata: dict[str, Any] = {"use_mean": use_mean}
+
+            if method == "monte_carlo":
+                engine = self._resolve_mc_engine(mc_engine)
+                metadata.update(
+                    {
+                        "mc_engine": engine.__class__.__name__,
+                        "engine_params": engine.get_params(),
+                        "engine_kwargs": engine_kwargs,
+                    }
+                )
+
             return self._build_result(
-                metric_name = "ExpectedShortfall",
-                method = method,
-                value = es_amount,
-                confidence_level = confidence_level,
-                holding_period = holding_period,
-                use_mean = use_mean,
+                metric_name="ExpectedShortfall",
+                method=method,
+                value=es_amount,
+                confidence_level=confidence_level,
+                holding_period=holding_period,
+                **metadata,
             )
         return es_amount
 
@@ -279,31 +388,46 @@ class BaseVaR(ABC) :
         return self.metrics.basic_summary_stats(returns)
 
     def summary(
-            self,
-            confidence_level: float = 0.95,
-            holding_period: int = 1,
+        self,
+        confidence_level: float = 0.95,
+        holding_period: int = 1,
+        mc_engine: BaseMonteCarlo | None = None,
+        **engine_kwargs: Any,
     ) -> dict :
         self.validator.validate_confidence_level(confidence_level)
         self.validator.validate_holding_period(holding_period)
 
         data = {
             "historical_var": self.historical_var(
-                confidence_level = confidence_level,
-                holding_period = holding_period,
+                confidence_level=confidence_level,
+                holding_period=holding_period,
             ),
             "parametric_var": self.parametric_var(
-                confidence_level = confidence_level,
-                holding_period = holding_period,
+                confidence_level=confidence_level,
+                holding_period=holding_period,
+            ),
+            "monte_carlo_var": self.monte_carlo_var(
+                confidence_level=confidence_level,
+                holding_period=holding_period,
+                mc_engine=mc_engine,
+                **engine_kwargs,
             ),
             "historical_es": self.expected_shortfall(
-                confidence_level = confidence_level,
-                holding_period = holding_period,
-                method = "historical",
+                confidence_level=confidence_level,
+                holding_period=holding_period,
+                method="historical",
             ),
             "parametric_es": self.expected_shortfall(
-                confidence_level = confidence_level,
-                holding_period = holding_period,
-                method = "parametric",
+                confidence_level=confidence_level,
+                holding_period=holding_period,
+                method="parametric",
+            ),
+            "monte_carlo_es": self.expected_shortfall(
+                confidence_level=confidence_level,
+                holding_period=holding_period,
+                method="monte_carlo",
+                mc_engine=mc_engine,
+                **engine_kwargs,
             ),
         }
 
